@@ -5,10 +5,25 @@ import { query } from "../config/db.js";
 import { AuditService } from "../services/audit.service.js";
 
 export async function login(req: Request, res: Response): Promise<void> {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
   const ip = req.ip || req.socket.remoteAddress || "unknown";
 
+  if (!email || !password) {
+    res.status(400).json({ error: "Email and password are required." });
+    return;
+  }
+
   const users = await query<any>("SELECT * FROM users WHERE email = ?", [email]);
+  if (users.length === 0) {
+    await AuditService.record({
+      action: "USER_LOGIN_FAILED",
+      ipAddress: ip,
+      status: "DENIED",
+      metadata: { attemptedEmail: email }
+    });
+    res.status(401).json({ error: "Invalid credentials." });
+    return;
+  }
   if (users.length === 0) {
     await AuditService.record({
       action: "USER_LOGIN_FAILED",

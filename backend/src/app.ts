@@ -2,7 +2,7 @@ import express from "express";
 import helmet from "helmet";
 import cors from "cors";
 import { login } from "./controllers/auth.controller.js";
-import { uploadDocument, listDocuments } from "./controllers/document.controller.js";
+import { uploadDocument, listDocuments, downloadDocument } from "./controllers/document.controller.js";
 import { authenticate } from "./middleware/auth.middleware.js";
 import { uploadMemory, validateUploadedFile } from "./middleware/upload.middleware.js";
 
@@ -27,3 +27,4 @@ app.post(
   validateUploadedFile,
   uploadDocument
 );
+app.get("/api/documents/:id/download", authenticate, downloadDocument);
