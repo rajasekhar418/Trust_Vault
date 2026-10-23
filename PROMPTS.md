@@ -1,6 +1,6 @@
 # TrustVault Development & AI Interaction Log (PROMPTS.md)
 
-## Entry 1 — 2026-10-21: Audit Trail Immutability & Database Architecture
+## Entry 1 ï¿½ 2026-10-21: Audit Trail Immutability & Database Architecture
 * **Prompt Summary:**
   Asked the assistant for the best way to implement an append-only audit trail and immediate access revocation for a zero-trust document platform using MySQL.
 * **What the AI Initially Proposed:**
@@ -15,7 +15,7 @@
 
 __________________________________________________________________________________________________________________________________________
 
-## Entry 2 — 2026-10-22: File Ingestion Hardening & Remediation of Day 1 Storage Flaws
+## Entry 2 ï¿½ 2026-10-22: File Ingestion Hardening & Remediation of Day 1 Storage Flaws
 * **Prompt Summary:**
   Asked the assistant how to implement document ingestion, file type validation, and disk storage based on the schema established in Day 1.
 * **What the AI Initially Proposed:**
@@ -29,3 +29,38 @@ ________________________________________________________________________________
   2. Implemented magic-byte inspection using `file-type` to inspect the raw file signature (e.g., `%PDF-1.4` binary signatures), rejecting any file whose internal structure contradicts its declared type with HTTP 400.
   3. Decoupled physical storage from user input: all files are written to an isolated storage folder named strictly as server-generated random UUIDs without file extensions.
   4. Streamed the raw buffer through Node's `crypto.createHash('sha256')` during ingestion to store an authoritative fingerprint in MySQL.
+
+  _______________________________________________________________________________________________________________
+
+  ## Day 3: At-Rest Cryptographic Architecture & Authenticated Streaming Retrieval
+
+### 1. Objective & Architectural Goal
+- Transition Trust Vault from storing unencrypted files on disk to a zero-knowledge at-rest cryptographic architecture using **AES-256-GCM**.
+- Implement authenticated streaming retrieval so sensitive documents are never written decrypted to disk or buffered entirely into server memory, while enforcing strict ownership access and tamper detection.
+
+---
+
+### 2. Architectural Flaws Identified & Iterative Fixes
+- **Flaw 1: Plaintext Storage at Rest**
+  - *Previous State:* File uploads were placed directly onto the server file system in plaintext, making documents vulnerable to local compromise.
+  - *Resolution:* Implemented stream-based AES-256-GCM encryption writing raw ciphertext (`.enc`) directly to isolated storage (`storage/encrypted/<id>.enc`).
+- **Flaw 2: Missing Cryptographic Metadata in Schema**
+  - *Previous State:* The database only tracked basic file metadata (`title`, `storage_path`, `sha256_checksum`). Authenticated decryption was impossible without tracking per-file cryptographic parameters.
+  - *Resolution:* Migrated the database schema to store dedicated `iv` (`VARCHAR(32)`) and `auth_tag` (`VARCHAR(32)`) columns adjacent to `sha256_checksum`.
+- **Flaw 3: In-Memory Multer vs. Disk Path Controller Mismatch**
+  - *Previous State:* The upload route utilized in-memory buffering (`uploadMemory.single("file")`), but the controller attempted to read from `req.file.path`, resulting in runtime crashes.
+  - *Resolution:* Refactored `uploadDocument` to convert the in-memory buffer (`req.file.buffer`) directly into a readable stream (`Readable.from(...)`), encrypting straight to disk without leaving plaintext remnants on the filesystem.
+- **Flaw 4: Missing Endpoint Exposure**
+  - *Previous State:* `downloadDocument` was declared inside the controller but not mounted in `src/app.ts`.
+  - *Resolution:* Registered `GET /api/documents/:id/download` protected behind the `authenticate` middleware.
+
+---
+
+### 3. Implementation Details & Prompts
+- **Database Schema Migration:**
+  ```sql
+  ALTER TABLE documents 
+    ADD COLUMN iv VARCHAR(32) NOT NULL AFTER sha256_checksum,
+    ADD COLUMN auth_tag VARCHAR(32) NOT NULL AFTER iv;
+
+    
