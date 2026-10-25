@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { query } from "../config/db.js";
 
+
 export class AuditService {
   static async record(params: {
     actorId?: string | null;
