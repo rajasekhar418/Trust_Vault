@@ -1,7 +1,12 @@
-﻿import axios from "axios";
+﻿import axios from 'axios';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://trust-vault-backend.onrender.com/api';
 
 const api = axios.create({
-  baseURL: "/api",
+  baseURL: API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
 });
 
 api.interceptors.request.use((config) => {

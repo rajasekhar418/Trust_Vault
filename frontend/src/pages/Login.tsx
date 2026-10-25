@@ -42,7 +42,7 @@ export const Login: React.FC = () => {
 
         {error && (
           <div className="mb-6 p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-sm rounded-lg text-center">
-            {error}
+            {typeof error === 'string' ? error : (error as any)?.message || 'Login failed'}
           </div>
         )}
 
