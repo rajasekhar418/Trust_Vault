@@ -64,3 +64,44 @@ ________________________________________________________________________________
     ADD COLUMN auth_tag VARCHAR(32) NOT NULL AFTER iv;
 
     
+_______________________________________________________________________________________________________________
+
+## Entry 4 — 2026-10-24: Granular Access Delegation, Instant Revocation & Client Boundary Enforcement
+- **Prompt Summary:**
+  Asked the assistant how to implement per-document sharing with configurable permissions (`VIEW`, `EDIT`, `DOWNLOAD`), access quotas, and frontend document viewing for delegated recipients.
+- **What the AI Initially Proposed:**
+  1. The AI generated a MySQL query to fetch shared documents that included `AND ds.download_count < ds.max_downloads` across all share records.
+  2. The AI implemented the download streaming controller to increment `download_count` unconditionally on every GET request to `/api/documents/:id/download` and send `Content-Disposition: attachment`.
+  3. On the frontend, the AI proposed rendering decrypted documents by generating an object URL and opening it directly via `window.open(blobUrl, "_blank")`.
+- **Specific Flaws Identified:**
+  1. **Silent Dropping of View-Only Records (Three-Valued Logic Trap):** View-only grants set `max_downloads = NULL` because viewing in-browser does not consume a download permit. In MySQL three-valued logic, `download_count < NULL` evaluates to `UNKNOWN` (falsy). This caused every view-only document to disappear from the viewer's dashboard.
+  2. **Premature Download Quota Depletion & Forced File Attachment:** Decrementing quotas on every GET hit drained view-only access quotas prematurely. Setting `Content-Disposition: attachment` triggered the browser's download manager even when the owner only granted read-only viewing permissions.
+  3. **Client-Side Boundary Bypass:** Opening the raw blob URL in an external tab invoked the browser's default PDF viewer plugin, providing prominent native "Save", "Print", and "Download" toolbars to view-only users.
+- **What Was Implemented Instead:**
+  1. Corrected the SQL sharing filter to explicitly support view-only permits and unbound download caps:
+     ```sql
+     AND (ds.permission = 'VIEW' OR ds.max_downloads IS NULL OR ds.download_count < ds.max_downloads)
+     ```
+  2. Implemented strict header and quota separation: served `Content-Disposition: inline` for `VIEW` sessions and only incremented `download_count` when `permission === 'DOWNLOAD'`.
+  3. Built a secure in-app modal embedding an `<iframe>` loaded with `#toolbar=0&navpanes=0`, suppressed right-click context menus (`e.preventDefault()`), and blocked standard print/save hotkeys (`Ctrl+S`, `Ctrl+P`).
+  4. Enforced immediate revocation: deleting a record from `document_shares` halts subsequent stream decryption requests instantly, returning HTTP 404/403.
+
+_______________________________________________________________________________________________________________
+
+## Entry 5 — 2026-10-25: Cryptographic Tamper Detection, Hash Chaining & Route Protection
+- **Prompt Summary:**
+  Asked the assistant how to handle decryption runtime exceptions, structure rate limiting, and finalize the tamper-detection pipeline when streaming AES-256-GCM ciphertexts.
+- **What the AI Initially Proposed:**
+  1. The AI wrapped `CryptoService.decryptFileStream` in a generic `try/catch` block returning a standard `500 Internal Server Error`.
+  2. The AI left CORS set to a wildcard `origin: "*"` and left authentication endpoints unthrottled.
+  3. In Express routing, the AI registered `/api/documents/:id` before `/api/documents/shared-with-me`.
+- **Specific Flaws Identified:**
+  1. **Masking Deliberate Bit-Flipping as Infrastructure Failure:** In AES-256-GCM, ciphertext bit manipulation or storage corruption causes the 16-byte authentication tag to fail validation (`ERR_CRYPTO_INITIALIZATION_ERROR`). Masking this behind a generic 500 error prevented administrators from distinguishing between server crashes and active storage tampering attacks, leaving the audit log blind.
+  2. **Brute-Force & Cross-Origin Exposure:** Without endpoint-level rate limiting, `/api/auth/login` was vulnerable to credential stuffing attacks. A wildcard CORS policy allowed unauthorized web origins to make authenticated credentialed requests.
+  3. **Route Precedence Collision:** Express route matching captured the string literal `"shared-with-me"` as a dynamic `:id` parameter, causing database queries to fail with UUID validation errors.
+- **What Was Implemented Instead:**
+  1. Separated cryptographic integrity failures from filesystem errors: explicitly caught GCM auth tag verification failures, immediately recorded an immutable `DOCUMENT_TAMPER_DETECTED` audit record with the actor ID and document ID, and returned HTTP 400.
+  2. Locked CORS strictly to the configured frontend origin (`process.env.FRONTEND_ORIGIN || "http://localhost:5173"`) and added `express-rate-limit` to `/api/auth/login` (capping requests at 15 attempts per 15-minute window) and document uploads.
+  3. Re-ordered routes in `app.ts` so `/api/documents/shared-with-me` is evaluated prior to dynamic parameter route `/api/documents/:id`.
+  4. Verified cryptographic audit trail immutability where each row's SHA-256 hash depends on the preceding row:
+     `current_hash = SHA256(previous_hash + actor_id + action + timestamp + resource_id)`

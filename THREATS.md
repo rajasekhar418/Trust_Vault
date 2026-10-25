@@ -1,51 +1,98 @@
-﻿# THREATS.md — TrustVault Security Model & Threat Assessment
+﻿# THREATS.md — TrustVault Threat Model & Risk Posture
 
-## 1. Threats Identified and Mitigated
+This document details the threat landscape evaluated during the design and implementation of TrustVault. It maps the attack surfaces, vectors, engineering mitigations, automated verification tests, and knowingly accepted architectural risks.
 
-### T-01: Insecure Direct Object Reference (IDOR) on Document Retrieval
-- **Threat**: An authenticated user modifies the document UUID parameter in `/api/documents/:id/download` to inspect or download confidential files belonging to other organizations or departments.
-- **Mitigation**: Authorization is strictly enforced in SQL joins at the database layer on every call. The document row is only returned if `d.owner_id = userId` OR an active, unexpired record exists in `document_shares` matching `shared_with_user_id`. No file handle or decryption key is processed if this join returns 0 rows.
-- **Verification**: Covered by `RULE 1` in `tests/security.test.ts`.
+---
 
-### T-02: Stale Permission Persistence via Pre-Signed URL Caching
-- **Threat**: Revoking access does not invalidate previously issued S3 pre-signed URLs or cached bearer links, leaving a window of exposure until token expiration.
-- **Mitigation**: TrustVault rejects pre-signed static storage URLs. All decrypted file bytes stream directly through Node.js after a real-time database validation query. Deleting a grant immediately breaks access for subsequent chunk requests.
-- **Verification**: Covered by `RULE 2` in `tests/security.test.ts`.
+## 1. Threat Matrix & Mitigations
 
-### T-03: Ciphertext Manipulation and Bit-Flipping Attacks
-- **Threat**: An attacker with filesystem access or compromised host storage alters bits in stored ciphertext to corrupt data or attempt chosen-ciphertext attacks.
-- **Mitigation**: Implementation of AES-256-GCM (Authenticated Encryption with Associated Data). Node crypto deciphers verify a 16-byte authentication tag (`auth_tag`). Any byte corruption immediately throws an authentication error, halts streaming, issues HTTP 400, and records a `DOCUMENT_TAMPER_DETECTED` security audit log.
-- **Verification**: Covered by `RULE 3` in `tests/security.test.ts`.
+### T1: Insecure Direct Object Reference (IDOR) & Horizontal Privilege Escalation
+* **Vector**: An authenticated caller modifies `document_id` in API calls (e.g., `GET /api/documents/:id/download` or `PATCH /api/documents/:id`) to retrieve or tamper with files owned by other organizations or users.
+* **Mitigation**:
+  * Request parameters (`req.params.id`) are never trusted without authoritative database validation.
+  * Every query joins against the authenticated user context (`req.user.id`) from the verified JWT:
+    ```sql
+    SELECT d.*, ds.permission, ds.download_count, ds.max_downloads, ds.expires_at 
+    FROM documents d
+    LEFT JOIN document_shares ds 
+      ON d.id = ds.document_id AND ds.shared_with_user_id = ?
+    WHERE d.id = ? 
+      AND d.is_deleted = 0 
+      AND (d.owner_id = ? OR ds.id IS NOT NULL)
+    ```
+  * Admins cannot download file ciphertext without explicit share grants or documented ownership.
+* **Automated Test**: `tests/security.test.ts` -> `RULE 1: Unauthorized user CANNOT access unshared document` (returns HTTP 404/403).
 
-### T-04: Audit Trail Repudiation and Silent Row Tampering
-- **Threat**: A compromised administrative account alters or deletes historical access records in the database to conceal illicit exfiltration.
-- **Mitigation**: Cryptographic hash chaining. Each audit row stores:
-  `current_hash = SHA256(previous_hash + actor_email + action + timestamp + resource_id)`
-  Modifying any historical log breaks the verification chain for all subsequent entries.
+---
 
-### T-05: Malicious Executable Disguise Attacks
-- **Threat**: An attacker uploads executable binaries (`.exe`, `.sh`, `.php`) masked with a `.pdf` or `.png` extension to execute remote code on worker services.
-- **Mitigation**: Signature-level magic byte inspection in `uploadDocument`. Files are inspected for binary signatures (`%PDF`, `\x89PNG`, `\xFF\xD8\xFF`, `PK`) and blocked extensions are rejected before cipher streaming.
+### T2: Stale Authorization Window via Pre-Signed Links or Cached Tokens
+* **Vector**: An owner revokes access, but a recipient retains an active pre-signed S3 URL, an unexpired capability token, or a client cache entry allowing ongoing downloads.
+* **Mitigation**:
+  * Pre-signed static links are completely excluded from the architecture.
+  * Documents are encrypted at rest with AES-256-GCM and streamed exclusively through dynamic Node.js transform streams.
+  * The database check executes atomically on the download request. Deleting a grant from `document_shares` halts subsequent requests immediately.
+* **Automated Test**: `tests/security.test.ts` -> `RULE 2: Revoking access immediately prevents file decryption` (subsequent GET returns HTTP 403).
 
-### T-06: Authentication Brute-Force & Credential Stuffing
-- **Threat**: Automated dictionary attacks against `/api/auth/login` to compromise user passwords.
-- **Mitigation**: IP-based rate limiting via `express-rate-limit` capped at 5 attempts per 15-minute window per IP address, backed by bcrypt hash rounds.
+---
+
+### T3: Storage Tampering & Ciphertext Bit-Flipping
+* **Vector**: An attacker with direct disk or database access modifies ciphertext bits, alters the encrypted payload, or injects malicious content into existing files.
+* **Mitigation**:
+  * TrustVault uses authenticated encryption with associated data (**AES-256-GCM**).
+  * Every encrypted document stores an initialization vector (`iv`, 12 bytes) and an authentication tag (`auth_tag`, 16 bytes).
+  * If a single byte of ciphertext or metadata is modified, the GCM decipher verification fails with an authentication tag error (`ERR_CRYPTO_INITIALIZATION_ERROR`).
+  * The controller traps this error, immediately aborts the stream, responds with HTTP 400, and logs an immutable `DOCUMENT_TAMPER_DETECTED` security alert.
+* **Automated Test**: `tests/security.test.ts` -> `RULE 3: Storage cipher modification triggers GCM tag integrity failure`.
+
+---
+
+### T4: Audit Trail Repudiation & Silent Log Manipulation
+* **Vector**: An internal actor with database access modifies or drops rows in `audit_logs` to conceal unauthorized downloads, deletions, or metadata modifications.
+* **Mitigation**:
+  * **Cryptographic Hash Chaining**: Every log row computes a SHA-256 hash linking to the preceding entry:
+    $$\text{current\_hash} = \text{SHA256}(\text{previous\_hash} + \text{actor\_id} + \text{action} + \text{timestamp} + \text{resource\_id})$$
+  * Any manual deletion or inline update breaks the hash linkage for all downstream records.
+  * **Database-Level Trigger Enforcement**: `BEFORE UPDATE` and `BEFORE DELETE` triggers reject mutations directly in MySQL using `SIGNAL SQLSTATE '45000'`.
+
+---
+
+### T5: Malicious File Ingestion & Executable Polyglots
+* **Vector**: An attacker renames an executable script or Windows PE binary (`malware.exe` to `invoice.pdf`) and transmits a spoofed `Content-Type: application/pdf` header to bypass extension checks.
+* **Mitigation**:
+  * The server uses in-memory file ingestion (`memoryStorage()`) and inspects file magic bytes using `file-type` before writing to disk.
+  * Only whitelisted binary signatures (`application/pdf`, `image/png`, `image/jpeg`, `application/vnd.openxmlformats-officedocument...`) are accepted.
+  * Executable formats (`application/x-dosexec`, shell scripts) are rejected with HTTP 400.
+  * Files are stored under random server-generated UUIDs without original filenames to eliminate directory traversal exploits (`../../etc/passwd`).
+
+---
+
+### T6: Credential Stuffing & Denial of Service (DoS)
+* **Vector**: Automated bots brute-force the authentication gateway or exhaust server memory by uploading oversized file streams.
+* **Mitigation**:
+  * Configured `express-rate-limit` on `/api/auth/login` (limited to 15 attempts per 15 minutes per IP).
+  * Configured upload throttles (limited to 20 requests per minute per IP).
+  * Enforced file size limits (10 MB cap) at the Multer buffer ingestion stage.
 
 ---
 
 ## 2. Knowingly Accepted Residual Risks
 
-### R-01: Client-Side Content Extraction in "View-Only" Mode
-- **Threat**: A recipient granted `VIEW` permissions captures the document data.
-- **Why Accepted**: In a zero-plugin web architecture, decrypted bytes for PDF/image previews must reach client memory to be rendered by the DOM or canvas. While the UI disables right-click menus, hides browser toolbars, and blocks standard `Ctrl+P`/`Ctrl+S` commands, OS-level screen captures (e.g., Windows Snipping Tool) and memory inspection cannot be cryptographically blocked by the server. 
-- **Compensating Controls**: Strict download rate limiting, disabling direct file attachment headers (`Content-Disposition: inline`), and immutable logging of every view event to guarantee non-repudiation.
+The following limitations were evaluated and consciously accepted in the design:
 
-### R-02: Stolen JWT Persistence During Active Token Lifetime
-- **Threat**: If a user's JWT is exfiltrated from client storage, the bearer token remains valid until expiration.
-- **Why Accepted**: Using stateless JWTs allows high-throughput API verification without requiring session lookups on static routes.
-- **Compensating Controls**: Short 15-minute access token lifespan, coupled with real-time per-request database validation of document permissions (`document_shares`) so revoking document access takes effect immediately regardless of JWT validity.
+| ID | Residual Threat | Reason for Acceptance | Compensating Security Control |
+| :--- | :--- | :--- | :--- |
+| **R1** | **Client-Side Screengrab / External Camera Capture** | Once decrypted pixels are rendered on a physical monitor, hardware-level screen captures or external camera recordings cannot be prevented by web applications. | All view sessions require authentication and append an immutable `DOCUMENT_VIEWED` record to the audit trail for strict legal non-repudiation. |
+| **R2** | **Compromise of `MASTER_KEY` via Host Environment Breach** | If the host OS running Node.js is compromised, an attacker with root memory access can extract runtime environment variables. | Key access is restricted to the execution environment via `.env` / secret managers. File contents remain protected against offline disk theft. |
+| **R3** | **Single Point of Database Administration** | A root DBA with full server privileges can theoretically disable triggers or drop the entire `audit_logs` table. | Audit rows are cryptographically hash-chained so that selective tampering cannot be hidden; full reconstruction or export to external SIEM/WORM storage can detect total drops. |
 
-### R-03: Node.js Master Key Residency in Memory
-- **Threat**: A root user performing a physical memory dump of the host process could inspect the 32-byte AES Master Key.
-- **Why Accepted**: Symmetric AES encryption requires the raw key inside process memory during cryptographic transformations.
-- **Compensating Controls**: In production, key operations should be offloaded to an external Hardware Security Module (HSM) or AWS KMS envelope encryption.
+---
+
+## 3. Threat Verification Mapping
+
+| Threat Reference | Core Component | Automated Test Suite | Passing Verdict |
+| :--- | :--- | :--- | :--- |
+| **T1: IDOR / Access Reach** | `share.controller.ts` | `tests/security.test.ts` (Rule 1) | PASS |
+| **T2: Revocation Infallibility** | `document.controller.ts` | `tests/security.test.ts` (Rule 2) | PASS |
+| **T3: Ciphertext Tampering** | `crypto.service.ts` | `tests/security.test.ts` (Rule 3) | PASS |
+| **T4: Audit Hash Chaining** | `audit.service.ts` | `tests/audit.test.ts` | PASS |
+| **T5: Magic-Byte Inspection** | `document.controller.ts` | `tests/upload.test.ts` | PASS |
